@@ -1,0 +1,150 @@
+@extends('layouts.app')
+
+@section('content')
+<div class="container">
+    <div class="row justify-content-center">
+        <div class="col-md-8">
+            <div class="card">
+                <div class="card-header">
+                    <h4>🎯 Zuse RBAC Dashboard</h4>
+                </div>
+
+                <div class="card-body">
+                    @if (session('status'))
+                        <div class="alert alert-success" role="alert">
+                            {{ session('status') }}
+                        </div>
+                    @endif
+
+                    @if (session('success'))
+                        <div class="alert alert-success" role="alert">
+                            {{ session('success') }}
+                        </div>
+                    @endif
+
+                    @if (session('error'))
+                        <div class="alert alert-danger" role="alert">
+                            {{ session('error') }}
+                        </div>
+                    @endif
+
+                    <div class="mb-4">
+                        <h5>👋 Welcome, {{ Auth::user()->name }}!</h5>
+                        <p class="text-muted">You are successfully authenticated with Zuse RBAC.</p>
+                    </div>
+
+                    <div class="row">
+                        <div class="col-md-6">
+                            <div class="card border-info">
+                                <div class="card-header bg-info text-white">
+                                    <h6 class="mb-0">🔐 User Information</h6>
+                                </div>
+                                <div class="card-body">
+                                    <p><strong>Email:</strong> {{ Auth::user()->email }}</p>
+                                    <p><strong>Keycloak ID:</strong> {{ Auth::user()->keycloak_id ?? 'Not set' }}</p>
+                                    <p><strong>Account Type:</strong> Zuse RBAC User</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="col-md-6">
+                            <div class="card border-success">
+                                <div class="card-header bg-success text-white">
+                                    <h6 class="mb-0">👥 Roles & Permissions</h6>
+                                </div>
+                                <div class="card-body">
+                                    @if(Auth::user()->roles && count(Auth::user()->roles) > 0)
+                                        <p><strong>Your Roles:</strong></p>
+                                        <ul class="list-unstyled">
+                                            @foreach(Auth::user()->roles as $role)
+                                                <li><span class="badge bg-primary">{{ $role }}</span></li>
+                                            @endforeach
+                                        </ul>
+                                    @else
+                                        <p class="text-muted">No roles assigned</p>
+                                    @endif
+
+                                    @if(Auth::user()->groups && count(Auth::user()->groups) > 0)
+                                        <p><strong>Your Groups:</strong></p>
+                                        <ul class="list-unstyled">
+                                            @foreach(Auth::user()->groups as $group)
+                                                <li><span class="badge bg-secondary">{{ $group }}</span></li>
+                                            @endforeach
+                                        </ul>
+                                    @else
+                                        <p class="text-muted">No groups assigned</p>
+                                    @endif
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Role-based Content Examples -->
+                    <div class="mt-4">
+                        <h5>🎯 Role-based Content Examples</h5>
+                        
+                        @if(Auth::user()->hasRole('admin'))
+                            <div class="alert alert-warning">
+                                <strong>🔧 Admin Panel:</strong> You have administrative access!
+                                <a href="#" class="btn btn-sm btn-warning ms-2">Admin Panel</a>
+                            </div>
+                        @endif
+
+                        @if(Auth::user()->hasRole('developer'))
+                            <div class="alert alert-info">
+                                <strong>💻 Developer Tools:</strong> You have developer access!
+                                <a href="#" class="btn btn-sm btn-info ms-2">Dev Tools</a>
+                            </div>
+                        @endif
+
+                        @if(Auth::user()->hasRole('manager'))
+                            <div class="alert alert-success">
+                                <strong>📊 Manager Dashboard:</strong> You have management access!
+                                <a href="#" class="btn btn-sm btn-success ms-2">Reports</a>
+                            </div>
+                        @endif
+
+                        @if(!Auth::user()->hasAnyRole(['admin', 'developer', 'manager']))
+                            <div class="alert alert-secondary">
+                                <strong>👤 User Dashboard:</strong> Standard user access.
+                            </div>
+                        @endif
+                    </div>
+
+                    <!-- Authentication Actions -->
+                    <div class="mt-4 border-top pt-3">
+                        <div class="d-flex justify-content-between">
+                            <div>
+                                <small class="text-muted">
+                                    Session started: {{ Auth::user()->created_at->format('M d, Y H:i') }}
+                                </small>
+                            </div>
+                            <div>
+                                <form method="POST" action="{{ route('keycloak.logout') }}" class="d-inline">
+                                    @csrf
+                                    <button type="submit" class="btn btn-outline-danger btn-sm">
+                                        🚪 Logout
+                                    </button>
+                                </form>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Integration Success Message -->
+                    <div class="mt-4 p-3 bg-light rounded">
+                        <div class="d-flex align-items-center">
+                            <div class="text-success me-2">
+                                <i class="fas fa-check-circle" style="font-size: 1.5rem;"></i>
+                            </div>
+                            <div>
+                                <strong>🎉 Integration Successful!</strong><br>
+                                <small class="text-muted">Your application is now integrated with Zuse RBAC. All authentication and authorization is handled centrally through Keycloak.</small>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+@endsection

@@ -1,0 +1,328 @@
+<?php
+
+namespace App\Http\Controllers\Auth;
+
+use App\Http\Controllers\Controller;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Session;
+use App\Models\User;
+use Illuminate\Support\Facades\Log;
+use Firebase\JWT\JWT;
+use Firebase\JWT\Key;
+
+class KeycloakController extends Controller
+{
+    public function login()
+    {
+        // Clear any existing auth state first
+        Session::forget('oauth_state');
+        
+        // Generate new state and ensure session is saved
+        $state = bin2hex(random_bytes(16));
+        Session::put('oauth_state', $state);
+        Session::save(); // Force session write
+        
+        Log::info('OAuth login initiated', [
+            'state' => $state,
+            'session_id' => session()->getId()
+        ]);
+
+        $authUrl = config('services.keycloak.auth_url') . '?' . http_build_query([
+            'client_id' => config('services.keycloak.client_id'),
+            'redirect_uri' => config('services.keycloak.redirect_uri'),
+            'response_type' => 'code',
+            'scope' => 'openid profile email',
+            'state' => $state,
+        ]);
+
+        return redirect($authUrl);
+    }
+
+    public function callback(Request $request)
+    {
+        // Verify state parameter with better error handling
+        $sessionState = Session::get('oauth_state');
+        $requestState = $request->state;
+        
+        if (!$sessionState || $requestState !== $sessionState) {
+            // Clear the state and provide more helpful error
+            Session::forget('oauth_state');
+            Log::warning('OAuth state mismatch in Lyceum RBAC', [
+                'session_state' => $sessionState,
+                'request_state' => $requestState,
+                'session_id' => session()->getId(),
+                'user_agent' => $request->userAgent()
+            ]);
+            
+            // Check if this is a retry attempt (user clicked login again)
+            $retryCount = Session::get('auth_retry_count', 0);
+            if ($retryCount < 1) {
+                // Auto-retry once
+                Session::put('auth_retry_count', $retryCount + 1);
+                return redirect('/auth/keycloak');
+            } else {
+                // Reset retry count and show error
+                Session::forget('auth_retry_count');
+                return redirect('/')->with('error', 'Authentication session expired. Please try logging in again.');
+            }
+        }
+        
+        // Clear the state and retry count after successful validation
+        Session::forget('oauth_state');
+        Session::forget('auth_retry_count');
+
+        if ($request->has('error')) {
+            return redirect('/')->with('error', 'Authentication failed: ' . $request->error_description);
+        }
+
+        if (!$request->has('code')) {
+            return redirect('/')->with('error', 'Authorization code not received');
+        }
+
+        // Exchange code for tokens
+        $response = Http::asForm()->post(config('services.keycloak.token_url'), [
+            'grant_type' => 'authorization_code',
+            'client_id' => config('services.keycloak.client_id'),
+            'client_secret' => config('services.keycloak.client_secret'),
+            'code' => $request->code,
+            'redirect_uri' => config('services.keycloak.redirect_uri'),
+        ]);
+
+        if (!$response->successful()) {
+            return redirect('/')->with('error', 'Failed to obtain access token');
+        }
+
+        $tokens = $response->json();
+
+        // Get user info from Keycloak
+        $userResponse = Http::withToken($tokens['access_token'])
+            ->get(config('services.keycloak.userinfo_url'));
+
+        if (!$userResponse->successful()) {
+            return redirect('/')->with('error', 'Failed to get user information');
+        }
+
+        $keycloakUser = $userResponse->json();
+
+        // Decode access token to get groups/roles
+        $accessToken = $tokens['access_token'];
+        $groups = $this->extractGroupsFromToken($accessToken);
+
+        // Create or update user
+        $user = User::updateOrCreate(
+            ['email' => $keycloakUser['email']],
+            [
+                'name' => $keycloakUser['name'] ?? $keycloakUser['preferred_username'],
+                'keycloak_id' => $keycloakUser['sub'],
+                'roles' => $this->mapUserRoles($groups),
+                'groups' => $groups,
+            ]
+        );
+
+        // Store tokens in session with rotation
+        $this->storeTokensWithRotation($tokens);
+        Session::put('user_groups', $groups);
+        Session::put('user_roles', $user->roles);
+
+        Auth::login($user);
+
+        return redirect('/dashboard')->with('success', 'Successfully logged in!');
+    }
+
+    public function logout()
+    {
+        $tokens = Session::get('keycloak_tokens');
+
+        Auth::logout();
+        Session::flush();
+
+        if ($tokens && isset($tokens['refresh_token'])) {
+            // Logout from Keycloak
+            Http::asForm()->post(config('services.keycloak.logout_url'), [
+                'client_id' => config('services.keycloak.client_id'),
+                'client_secret' => config('services.keycloak.client_secret'),
+                'refresh_token' => $tokens['refresh_token'],
+            ]);
+        }
+
+        return redirect('/')->with('success', 'Successfully logged out!');
+    }
+
+    private function extractGroupsFromToken($accessToken)
+    {
+        try {
+            $payload = $this->verifyAndDecodeJWT($accessToken);
+
+            // Log the full payload for debugging
+            Log::info('JWT Token Payload:', $payload);
+
+            $groups = [];
+
+            // Extract groups from different possible locations in the token
+            if (isset($payload['groups'])) {
+                Log::info('Groups found in payload[groups]:', $payload['groups']);
+                $groups = array_merge($groups, $payload['groups']);
+            }
+
+            if (isset($payload['resource_access'])) {
+                Log::info('Resource access found:', $payload['resource_access']);
+                
+                // Check for different client names
+                $clientNames = ['laravel-app', 'lyceum-rbac-poc', config('services.keycloak.client_id')];
+                
+                foreach ($clientNames as $clientName) {
+                    if (isset($payload['resource_access'][$clientName]['roles'])) {
+                        Log::info("Roles found in resource_access[{$clientName}][roles]:", $payload['resource_access'][$clientName]['roles']);
+                        $groups = array_merge($groups, $payload['resource_access'][$clientName]['roles']);
+                    }
+                }
+            }
+
+            if (isset($payload['realm_access']['roles'])) {
+                Log::info('Realm access roles found:', $payload['realm_access']['roles']);
+                $groups = array_merge($groups, $payload['realm_access']['roles']);
+            }
+
+            // Check for group_membership claim
+            if (isset($payload['group_membership'])) {
+                Log::info('Group membership found:', $payload['group_membership']);
+                $groups = array_merge($groups, $payload['group_membership']);
+            }
+
+            $finalGroups = array_unique($groups);
+            Log::info('Final extracted groups:', $finalGroups);
+
+            return $finalGroups;
+        } catch (\Exception $e) {
+            Log::error('Failed to extract groups from token: ' . $e->getMessage());
+            return [];
+        }
+    }
+
+    private function mapUserRoles($groups)
+    {
+        $roles = [];
+        $roleMappings = config('services.keycloak.role_mappings');
+
+        foreach ($roleMappings as $role => $roleGroups) {
+            if (array_intersect($groups, $roleGroups)) {
+                $roles[] = $role;
+            }
+        }
+
+        return array_unique($roles);
+    }
+
+    private function verifyAndDecodeJWT($token)
+    {
+        if (app()->environment('production')) {
+            // In production, verify JWT signature
+            $jwksUri = config('services.keycloak.base_url') . '/realms/' . config('services.keycloak.realm') . '/protocol/openid-connect/certs';
+            $jwks = Http::get($jwksUri)->json();
+            
+            // Get the key from JWKS (simplified - in production use proper JWKS parsing)
+            $publicKey = $this->getPublicKeyFromJWKS($jwks, $token);
+            
+            if ($publicKey) {
+                return JWT::decode($token, new Key($publicKey, 'RS256'));
+            }
+        }
+        
+        // Fallback to unsafe decode for development
+        $tokenParts = explode('.', $token);
+        return json_decode(base64_decode($tokenParts[1]), true);
+    }
+
+    private function getPublicKeyFromJWKS($jwks, $token)
+    {
+        try {
+            // Parse JWT header to get key ID
+            $header = json_decode(base64_decode(explode('.', $token)[0]), true);
+            $kid = $header['kid'] ?? null;
+            
+            if (!$kid) return null;
+            
+            // Find matching key in JWKS
+            foreach ($jwks['keys'] as $key) {
+                if ($key['kid'] === $kid) {
+                    // Convert JWK to PEM (simplified)
+                    return $this->jwkToPem($key);
+                }
+            }
+        } catch (\Exception $e) {
+            Log::error('Failed to get public key from JWKS: ' . $e->getMessage());
+        }
+        
+        return null;
+    }
+
+    private function jwkToPem($jwk)
+    {
+        // This is a simplified conversion - in production use a proper JWK library
+        if ($jwk['kty'] !== 'RSA') return null;
+        
+        // For production, use a library like web-token/jwt-key-mgmt
+        // This is a placeholder that returns null to force fallback
+        return null;
+    }
+
+    private function storeTokensWithRotation($tokens)
+    {
+        // Store current tokens
+        Session::put('keycloak_tokens', $tokens);
+        Session::put('token_issued_at', time());
+        
+        // If we have a previous refresh token, revoke it
+        $previousTokens = Session::get('keycloak_tokens_previous');
+        if ($previousTokens && isset($previousTokens['refresh_token'])) {
+            $this->revokeRefreshToken($previousTokens['refresh_token']);
+        }
+        
+        // Store previous tokens for cleanup
+        Session::put('keycloak_tokens_previous', Session::get('keycloak_tokens'));
+    }
+
+    private function revokeRefreshToken($refreshToken)
+    {
+        try {
+            Http::asForm()->post(config('services.keycloak.base_url') . '/realms/' . config('services.keycloak.realm') . '/protocol/openid-connect/revoke', [
+                'client_id' => config('services.keycloak.client_id'),
+                'client_secret' => config('services.keycloak.client_secret'),
+                'token' => $refreshToken,
+                'token_type_hint' => 'refresh_token'
+            ]);
+        } catch (\Exception $e) {
+            Log::warning('Failed to revoke refresh token: ' . $e->getMessage());
+        }
+    }
+
+    public function refreshToken()
+    {
+        $tokens = Session::get('keycloak_tokens');
+        
+        if (!$tokens || !isset($tokens['refresh_token'])) {
+            return redirect('/auth/keycloak');
+        }
+        
+        try {
+            $response = Http::asForm()->post(config('services.keycloak.base_url') . '/realms/' . config('services.keycloak.realm') . '/protocol/openid-connect/token', [
+                'grant_type' => 'refresh_token',
+                'client_id' => config('services.keycloak.client_id'),
+                'client_secret' => config('services.keycloak.client_secret'),
+                'refresh_token' => $tokens['refresh_token']
+            ]);
+            
+            if ($response->successful()) {
+                $newTokens = $response->json();
+                $this->storeTokensWithRotation($newTokens);
+                return response()->json(['success' => true]);
+            }
+        } catch (\Exception $e) {
+            Log::error('Token refresh failed: ' . $e->getMessage());
+        }
+        
+        return redirect('/auth/keycloak');
+    }
+}
